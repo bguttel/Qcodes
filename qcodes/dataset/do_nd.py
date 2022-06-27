@@ -2,6 +2,7 @@ import logging
 import sys
 import time
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import ExitStack, contextmanager
 from typing import (
     Callable,
@@ -688,6 +689,16 @@ class MultiSweep:
     def sweeps(self) -> Tuple[AbstractSweep, ...]:
         return self._sweeps
 
+    def get_setpoints(self) -> np.ndarray:
+        setpoints = np.zeros_like(self.sweeps[0].get_setpoints(), dtype=object)
+        for i in range(len(setpoints)):
+            setpoints[i] = tuple(sweep.get_setpoints()[i] for sweep in self._sweeps)
+        return setpoints
+
+    @property
+    def num_points(self) -> int:
+        return self.sweeps[0].num_points
+
 
 class _Sweeper:
     def __init__(
@@ -695,9 +706,18 @@ class _Sweeper:
         sweeps: Sequence[Union[AbstractSweep, MultiSweep]],
         additional_setpoints: Sequence[ParameterBase],
     ):
-        self._sweeps = sweeps
+        _sweeps = []
+
         self._additional_setpoints = additional_setpoints
-        self._nested_setpoints = self._make_nested_setpoints()
+        self._nested_setpoints = self._make_nested_setpoints(sweeps)
+        self._parameter_groups = self._make_parameter_groups(sweeps)
+        for sweep in sweeps:
+            if isinstance(sweep, AbstractSweep):
+                _sweeps.append(sweep)
+            else:
+                _sweeps.extend(sweep.sweeps)
+        self._sweeps = _sweeps
+        self._shapes = self._make_shape(sweeps, additional_setpoints)
 
         post_delays: List[float] = []
         params_set: List[ParameterBase] = []
@@ -711,18 +731,57 @@ class _Sweeper:
         self._params_set = tuple(params_set)
         self._post_actions = tuple(post_actions)
 
-    def _make_nested_setpoints(self) -> np.ndarray:
+    def _make_parameter_groups(self, sweeps):
+        # todo this only supports one Multisweep
+
+        ungrouped_parameters = []
+        grouped_parameters = []
+
+        for sweep in sweeps:
+            if isinstance(sweep, AbstractSweep):
+                ungrouped_parameters.append(sweep.param)
+            else:
+                grouped_parameters.extend(sweep.sweeps)
+        n_groups = len(grouped_parameters) or 1
+
+        groups = {f"group_{i}": [] for i in range(n_groups)}
+
+        for sweep_or_multi_sweep in sweeps:
+            if isinstance(sweep_or_multi_sweep, AbstractSweep):
+                for group in groups:
+                    group.append(sweep_or_multi_sweep.param)
+            else:
+                for i, sweep in enumerate(sweep_or_multi_sweep.sweeps):
+                    groups[f"group_{i}"].append(sweep.param)
+        return groups
+
+    def _make_nested_setpoints(
+        self, sweeps: Sequence[Union[AbstractSweep, MultiSweep]]
+    ) -> np.ndarray:
         """Create the cartesian product of all the setpoint values."""
-        if len(self._sweeps) == 0:
+        if len(sweeps) == 0:
             return np.array([[]])  # 0d sweep (do0d)
-        setpoint_values = [sweep.get_setpoints() for sweep in self._sweeps]
-        return _flatten_setpoint_values(setpoint_values)
+        setpoint_values = [sweep.get_setpoints() for sweep in sweeps]
+        return self._flatten_setpoint_values(setpoint_values)
 
     @staticmethod
     def _flatten_setpoint_values(setpoint_values: Sequence[np.ndarray]) -> np.ndarray:
         setpoint_grids = np.meshgrid(*setpoint_values, indexing="ij")
         flat_setpoint_grids = [np.ravel(grid, order="C") for grid in setpoint_grids]
-        return np.vstack(flat_setpoint_grids).T
+        new_flat_grids = []
+        # todo this is not the greatest. The idea is that when setpoint elements
+        # are tuples they will not be expanded by meshgrid so we can use them
+        # directly as being sweept in parallel.
+        for grid in flat_setpoint_grids:
+            if grid.dtype == np.dtype("O"):
+                n_params = len(grid[0])
+                for i in range(n_params):
+                    vals = np.array([grid[j][i] for j in range(len(grid))])
+                    new_flat_grids.append(vals)
+            else:
+                new_flat_grids.append(grid)
+
+        return np.vstack(new_flat_grids).T
 
     @property
     def nested_setpoints(self) -> np.ndarray:
@@ -735,11 +794,19 @@ class _Sweeper:
         )
 
     @property
-    def shape(self) -> Tuple[int, ...]:
-        loop_shape = tuple(sweep.num_points for sweep in self._sweeps) + tuple(
-            1 for _ in self._additional_setpoints
+    def sweep_groupes(self):
+        return self._parameter_groups
+
+    @staticmethod
+    def _make_shape(sweeps, addtional_setpoints) -> Tuple[int, ...]:
+        loop_shape = tuple(sweep.num_points for sweep in sweeps) + tuple(
+            1 for _ in addtional_setpoints
         )
         return loop_shape
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self._shapes
 
     @property
     def post_delays(self) -> Tuple[float, ...]:
@@ -875,9 +942,8 @@ def dond(
         },
     )
     try:
-        loop_shape = sweeper.shape
         shapes: Shapes = detect_shape_of_measurement(
-            measurements.measured_parameters, loop_shape
+            measurements.measured_parameters, sweeper.shape
         )
         LOG.debug("Detected shapes to be %s", shapes)
     except TypeError:
@@ -886,8 +952,8 @@ def dond(
             f"falling back to unknown shape."
         )
         shapes = None
-    meas_list = _create_measurements(
-        sweeper.all_setpoint_params,
+    meas_list = _create_measurements_grouped(
+        sweeper.sweep_groupes,
         enter_actions,
         exit_actions,
         exp,
@@ -925,6 +991,7 @@ def dond(
                 previous_setpoints = setpoints
 
                 param_set_list = []
+                param_set_dict = defaultdict(list)
                 for setpoint_param, setpoint, action, delay in zip(
                     sweeper.params_set,
                     setpoints,
@@ -932,6 +999,11 @@ def dond(
                     delays,
                 ):
                     _conditional_parameter_set(setpoint_param, setpoint)
+                    for group_name, group in sweeper.sweep_groupes.items():
+                        if setpoint_param in group:
+                            param_set_dict[group_name].append(
+                                (setpoint_param, setpoint)
+                            )
                     param_set_list.append((setpoint_param, setpoint))
                     for act in action:
                         act()
@@ -943,9 +1015,10 @@ def dond(
                     for measured in meas_value_pair:
                         if measured[0] in group["params"]:
                             group["measured_params"].append(measured)
+
                 for ind, datasaver in enumerate(datasavers):
                     datasaver.add_result(
-                        *param_set_list,
+                        *param_set_dict[f"group_{ind}"],
                         *measurements.grouped_parameters[f"group_{ind}"][
                             "measured_params"
                         ],
@@ -973,15 +1046,20 @@ def dond(
 
 def _parse_dond_arguments(
     *params: Union[AbstractSweep, Union[ParamMeasT, Sequence[ParamMeasT]]]
-) -> Tuple[List[AbstractSweep], List[Union[ParamMeasT, Sequence[ParamMeasT]]]]:
+) -> Tuple[
+    List[Union[AbstractSweep, MultiSweep]],
+    List[Union[ParamMeasT, Sequence[ParamMeasT]]],
+]:
     """
     Parse supplied arguments into sweep objects and measurement parameters
     and their callables.
     """
-    sweep_instances: List[AbstractSweep] = []
+    sweep_instances: List[Union[AbstractSweep, MultiSweep]] = []
     params_meas: List[Union[ParamMeasT, Sequence[ParamMeasT]]] = []
     for par in params:
         if isinstance(par, AbstractSweep):
+            sweep_instances.append(par)
+        elif isinstance(par, MultiSweep):
             sweep_instances.append(par)
         else:
             params_meas.append(par)
@@ -1075,6 +1153,64 @@ def _create_measurements(
         _register_parameters(meas, all_setpoint_params)
         _register_parameters(
             meas, meas_params, setpoints=all_setpoint_params, shapes=shapes
+        )
+        _set_write_period(meas, write_period)
+        _register_actions(meas, enter_actions, exit_actions)
+        meas_list.append(meas)
+    return tuple(meas_list)
+
+
+def _create_measurements_grouped(
+    setpoint_groups: Mapping[str, Sequence[ParameterBase]],
+    enter_actions: ActionsT,
+    exit_actions: ActionsT,
+    experiments: Optional[Union[Experiment, Sequence[Experiment]]],
+    grouped_parameters: Mapping[str, ParameterGroup],
+    shapes: Shapes,
+    write_period: Optional[float],
+    log_info: Optional[str],
+) -> Tuple[Measurement, ...]:
+    meas_list: List[Measurement] = []
+    if log_info is not None:
+        _extra_log_info = log_info
+    else:
+        _extra_log_info = "Using 'qcodes.dataset.dond'"
+
+    if not isinstance(experiments, Sequence):
+        experiments_internal: Sequence[Optional[Experiment]] = [
+            experiments for _ in grouped_parameters
+        ]
+    else:
+        experiments_internal = experiments
+
+    if len(experiments_internal) != len(grouped_parameters):
+        raise ValueError(
+            f"Inconsistent number of "
+            f"parameter groups and experiments "
+            f"got {len(grouped_parameters)} and {len(experiments_internal)}"
+        )
+
+    if len(setpoint_groups) == 1:
+        setpoint_groups = {
+            name: list(setpoint_groups.values())[0]
+            for name in grouped_parameters.keys()
+        }
+
+    if len(setpoint_groups) != len(grouped_parameters):
+        raise ValueError(
+            f"Inconsistent number of "
+            f"parameter groups and setpoint groups "
+            f"got {len(grouped_parameters)} and {len(setpoint_groups)}"
+        )
+
+    for group_name, exp in zip(grouped_parameters.keys(), experiments_internal):
+        meas_name = grouped_parameters[group_name]["meas_name"]
+        meas_params = grouped_parameters[group_name]["params"]
+        meas = Measurement(name=meas_name, exp=exp)
+        meas._extra_log_info = _extra_log_info
+        _register_parameters(meas, setpoint_groups[group_name])
+        _register_parameters(
+            meas, meas_params, setpoints=setpoint_groups[group_name], shapes=shapes
         )
         _set_write_period(meas, write_period)
         _register_actions(meas, enter_actions, exit_actions)

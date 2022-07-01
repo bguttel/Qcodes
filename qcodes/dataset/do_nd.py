@@ -733,20 +733,26 @@ class _Sweeper:
         self._params_set = tuple(params_set)
         self._post_actions = tuple(post_actions)
 
-    def _make_parameter_groups(self, sweeps, additional_setpoints):
+    def _make_parameter_groups(
+        self,
+        sweeps: Sequence[Union[AbstractSweep, MultiSweep]],
+        additional_setpoints: Sequence[ParameterBase],
+    ) -> Dict[str, List[ParameterBase]]:
         # todo this only supports one Multisweep
 
-        ungrouped_parameters = []
-        grouped_parameters = []
+        ungrouped_sweeps = []
+        grouped_sweeps: List[AbstractSweep] = []
 
         for sweep in sweeps:
             if isinstance(sweep, AbstractSweep):
-                ungrouped_parameters.append(sweep.param)
+                ungrouped_sweeps.append(sweep)
             else:
-                grouped_parameters.extend(sweep.sweeps)
-        n_groups = len(grouped_parameters) or 1
+                grouped_sweeps.extend(sweep.sweeps)
+        n_groups = len(grouped_sweeps) or 1
 
-        groups = {f"group_{i}": [] for i in range(n_groups)}
+        groups: Dict[str, List[ParameterBase]] = {
+            f"group_{i}": [] for i in range(n_groups)
+        }
 
         for sweep_or_multi_sweep in sweeps:
             if isinstance(sweep_or_multi_sweep, AbstractSweep):
@@ -794,17 +800,20 @@ class _Sweeper:
         return self._nested_setpoints
 
     @property
-    def all_setpoint_params(self):
+    def all_setpoint_params(self) -> Tuple[ParameterBase, ...]:
         return tuple(sweep.param for sweep in self._sweeps) + tuple(
             s for s in self._additional_setpoints
         )
 
     @property
-    def sweep_groupes(self):
+    def sweep_groupes(self) -> Dict[str, List[ParameterBase]]:
         return self._parameter_groups
 
     @staticmethod
-    def _make_shape(sweeps, addtional_setpoints) -> Tuple[int, ...]:
+    def _make_shape(
+        sweeps: Sequence[Union[AbstractSweep, MultiSweep]],
+        addtional_setpoints: Sequence[ParameterBase],
+    ) -> Tuple[int, ...]:
         loop_shape = tuple(sweep.num_points for sweep in sweeps) + tuple(
             1 for _ in addtional_setpoints
         )
@@ -1005,9 +1014,9 @@ def dond(
                     delays,
                 ):
                     _conditional_parameter_set(setpoint_param, setpoint)
-                    for group_name, group in sweeper.sweep_groupes.items():
-                        if setpoint_param in group:
-                            param_set_dict[group_name].append(
+                    for sweep_group_name, sweep_group in sweeper.sweep_groupes.items():
+                        if setpoint_param in sweep_group:
+                            param_set_dict[sweep_group_name].append(
                                 (setpoint_param, setpoint)
                             )
                     param_set_list.append((setpoint_param, setpoint))
